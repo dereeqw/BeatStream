@@ -9,7 +9,7 @@ QUE ES
   SPA (pagina unica HTML/CSS/JS incrustada en la variable UI, mas abajo). Busca,
   reproduce (audio y video) y descarga musica de YouTube / YouTube Music usando
   yt-dlp + ytmusicapi. Pensada para correr en una Raspberry Pi y empaquetarse en
-  un APK de Android con Capacitor (ver DOCUMENTACION.md).
+  un APK de Android con Chaquopy (ver GUIA-CHAQUOPY.md).
 
 COMO ARRANCA
   python app.py           ->  instala dependencias que falten y levanta en :5000
@@ -27,7 +27,7 @@ ARQUITECTURA (de arriba a abajo en este archivo)
   9. UI = r-string gigante ................ TODO el front (HTML+CSS+JS) como texto
  10. if __name__ == "__main__": ........... arranca el servidor
 
-MAPA DE LA API  (detalle completo en DOCUMENTACION.md)
+MAPA DE LA API
   GET  /api/stream/<vid>          audio por proxy con Range (302 reproducible)
   GET  /api/vstream/<vid>         video por proxy con Range
   GET  /api/search?q=&page=       resultados de busqueda
@@ -53,13 +53,15 @@ FRONTEND (dentro de la variable UI, en su bloque de script)
                    MA (elemento <audio>), radioOn, LANG (idioma).
   Render:          mkCard (renglon de cancion), mkShelfCard (tarjeta de shelf),
                    renderDash (inicio), renderArtist, loadFiles/Likes/Playlists.
-  Reproduccion:    playYT, loadQ, _videoNext, nextTrack; el audio real es MA.
+  Reproduccion:    playYT, loadQ, _videoNext, nextTrack. En navegador/Pi el
+                   audio es el elemento <audio> (MA); dentro del APK lo reproduce
+                   ExoPlayer nativo y MA queda como "reloj" (ver puente AndroidBG).
   Video:           openYTVideo / closeVideo + _enterVidFS/_exitVidFS (pantalla
-                   completa con requestFullscreen sobre #vidpanel; ver DOC).
+                   completa con requestFullscreen sobre #vidpanel).
   i18n:            TL(es) traduce; TR = diccionario ES->EN; applyI18n camina el DOM.
 
 Dependencias:  pip install flask yt-dlp mutagen requests ytmusicapi Pillow
-Guia completa, como extender y despliegue:  DOCUMENTACION.md
+Guia para compilar el APK:  GUIA-CHAQUOPY.md
 ================================================================================
 """
 import sys, subprocess
