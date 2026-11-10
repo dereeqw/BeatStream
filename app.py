@@ -61,7 +61,6 @@ FRONTEND (dentro de la variable UI, en su bloque de script)
   i18n:            TL(es) traduce; TR = diccionario ES->EN; applyI18n camina el DOM.
 
 Dependencias:  pip install flask yt-dlp mutagen requests ytmusicapi Pillow
-Guia para compilar el APK:  GUIA-CHAQUOPY.md
 ================================================================================
 """
 import sys, subprocess
