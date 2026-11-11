@@ -972,9 +972,10 @@ def _ytm_track(s, fallback_thumb=""):
     vid = s.get("videoId")
     if not vid:
         return None
-    # Portada cuadrada real (thumbnails de la cancion) -> si no, la del album -> y
-    # como ultimo recurso el frame del video. Asi se ve alineado como en YT Music.
-    thumb = _best_thumb(s.get("thumbnails"),
+    # Portada cuadrada real. OJO: segun el metodo de ytmusicapi la clave cambia:
+    # search/artista usan "thumbnails" (plural); get_watch_playlist (el RADIO) usa
+    # "thumbnail" (singular). Si no se leyeran ambas, el radio caia al frame 16:9.
+    thumb = _best_thumb(s.get("thumbnails") or s.get("thumbnail"),
                         fallback_thumb or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
     arts = s.get("artists") or []
     channel = ", ".join(a.get("name", "") for a in arts if a.get("name")) if arts else (s.get("author") or "")
