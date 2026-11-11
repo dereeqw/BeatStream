@@ -61,6 +61,7 @@ FRONTEND (dentro de la variable UI, en su bloque de script)
   i18n:            TL(es) traduce; TR = diccionario ES->EN; applyI18n camina el DOM.
 
 Dependencias:  pip install flask yt-dlp mutagen requests ytmusicapi Pillow
+Guia para compilar el APK:  GUIA-CHAQUOPY.md
 ================================================================================
 """
 import sys, subprocess
@@ -116,7 +117,7 @@ TASTE_FILE = BASE / "taste.json"
 #  CONFIG
 # ===================================================
 DEFAULT_CFG = {
-    "download_mode"  : "audio",  # "audio" | "video"
+    "download_mode"  : "video",  # "video" | "audio"  (audio-only fiable solo con ffmpeg / modo web)
     "audio_quality"  : "best",   # "best" (original) | "128" (compacto)
     "video_quality"  : "720",    # "best" | "1080" | "720" | "480" | "360"
     "audio_format"   : "mp3",    # "mp3" | "m4a" | "opus"
@@ -492,29 +493,81 @@ def get_video_info(vid: str, vq: str = "720") -> tuple:
 _scache: dict = {}
 
 def do_search(q: str, page: int = 0) -> dict:
-    """Busca canciones en YouTube y devuelve resultados paginados."""
+    """Busca CANCIONES (catalogo de musica estilo YT Music) via ytmusicapi; si no
+    esta disponible o no da resultados, cae a la busqueda general de YouTube.
+    (El modo video sigue intacto: cualquier cancion puede verse como video.)"""
     per = int(cfg["search_per_page"])
     n   = per * (page + 1)
     key = f"{q}|{n}"
     if key not in _scache:
-        opts = {**_base(), "extract_flat": True, "playlistend": n}
-        out  = []
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{n}:{q}", download=False)
-            for e in (info.get("entries") or []):
-                if not e or not e.get("id"): continue
-                dur = int(e.get("duration") or 0); m,s = divmod(dur,60)
-                out.append({
-                    "id"     : e["id"],
-                    "title"  : e.get("title","?"),
-                    "channel": e.get("channel") or e.get("uploader","?"),
-                    "dur"    : f"{m}:{s:02d}" if dur else "-",
-                    "thumb"  : f"https://i.ytimg.com/vi/{e['id']}/mqdefault.jpg",
-                })
+        out = []
+        # 1) Preferir ytmusicapi -> solo canciones (sin videos/vlogs/clips random)
+        if _ytm is not None:
+            try:
+                for e in _ytm.search(q, filter="songs", limit=n):
+                    vid = e.get("videoId")
+                    if not vid: continue
+                    arts = ", ".join(a.get("name","") for a in (e.get("artists") or []) if a.get("name"))
+                    out.append({
+                        "id"     : vid,
+                        "title"  : e.get("title","?"),
+                        "channel": arts or (e.get("album") or {}).get("name") or "?",
+                        "dur"    : e.get("duration") or "-",
+                        # Portada CUADRADA real de YT Music (no el frame 16:9 del video)
+                        "thumb"  : _best_thumb(e.get("thumbnails"),
+                                               f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"),
+                    })
+            except Exception:
+                out = []
+        # 2) Fallback: busqueda general de YouTube (yt-dlp)
+        if not out:
+            try:
+                opts = {**_base(), "extract_flat": True, "playlistend": n}
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(f"ytsearch{n}:{q}", download=False)
+                    for e in (info.get("entries") or []):
+                        if not e or not e.get("id"): continue
+                        dur = int(e.get("duration") or 0); m,s = divmod(dur,60)
+                        out.append({
+                            "id"     : e["id"],
+                            "title"  : e.get("title","?"),
+                            "channel": e.get("channel") or e.get("uploader","?"),
+                            "dur"    : f"{m}:{s:02d}" if dur else "-",
+                            "thumb"  : f"https://i.ytimg.com/vi/{e['id']}/mqdefault.jpg",
+                        })
+            except Exception:
+                out = []
         _scache[key] = out
     chunk = _scache[key][page*per:(page+1)*per]
-    return {"results":chunk,"page":page,
-            "has_next":len(_scache[key])>=n,"has_prev":page>0}
+    res = {"results":chunk,"page":page,
+           "has_next":len(_scache[key])>=n,"has_prev":page>0}
+    # Artistas y albumes SOLO en la primera pagina (seccion superior, estilo catalogo)
+    if page == 0 and _ytm is not None:
+        aakey = f"AA|{q}"
+        if aakey not in _scache:
+            albums = []; artists = []
+            try:
+                for a in _ytm.search(q, filter="artists", limit=per):
+                    nm = a.get("artist")
+                    if not nm: continue
+                    th = (a.get("thumbnails") or [{}])[-1].get("url", "")
+                    artists.append({"name": nm, "thumb": th})
+                    if len(artists) >= 8: break
+            except Exception:
+                artists = []
+            try:
+                for a in _ytm.search(q, filter="albums", limit=per):
+                    bid = a.get("browseId")
+                    if not bid: continue
+                    th = (a.get("thumbnails") or [{}])[-1].get("url", "")
+                    albums.append({"id": bid, "title": a.get("title", "?"),
+                                   "year": a.get("year", "") or "", "thumb": th})
+                    if len(albums) >= 10: break
+            except Exception:
+                albums = []
+            _scache[aakey] = {"albums": albums, "artists": artists}
+        res.update(_scache[aakey])
+    return res
 
 # ===================================================
 #  DESCARGA - config leída en tiempo de ejecución
@@ -663,9 +716,22 @@ def _do_dl(vid: str, ctx: dict = None):
                 }]},
             ]
         else:
-            # Sin ffmpeg (APK): baja audio-only directo (m4a/opus); mutagen etiqueta.
-            fmt = "140/bestaudio[ext=m4a]/251/bestaudio[vcodec=none]"
-            attempts = [{}]
+            # Sin ffmpeg (APK): baja una pista AUDIO-ONLY directa (sin merge, sin ffmpeg).
+            # Cadena de itags audio-only + fallbacks, de mayor a menor calidad:
+            #   140=m4a128  251=opus160  139=m4a48  250=opus70  249=opus50
+            # Todos son vcodec=none => JAMAS seleccionan video. mutagen etiqueta despues.
+            fmt = ("140/251/139/250/249/"
+                   "bestaudio[ext=m4a]/bestaudio[ext=webm]/"
+                   "bestaudio[vcodec=none]/bestaudio")
+            # fixup=never: sin ffmpeg, el "fixup" del contenedor m4a falla y tumbaba
+            # la descarga; el audio puro no necesita ese arreglo. Segundo intento con
+            # otra seleccion de formato por si el itag preferido no esta disponible.
+            attempts = [
+                {"fixup": "never",
+                 "extractor_args": {"youtube": {"player_client": ["android_music", "android", "ios", "web"]}}},
+                {"fixup": "never", "format": "bestaudio[vcodec=none]/bestaudio",
+                 "extractor_args": {"youtube": {"player_client": ["android_music", "ios", "web", "android"]}}},
+            ]
 
     else:
         # -- VIDEO -----------------------------------------------
@@ -789,8 +855,15 @@ def api_stream(vid):
             resp_hdrs["Content-Length"] = upstream.headers["Content-Length"]
 
         def generate():
-            for chunk in upstream.iter_content(chunk_size=65536):
-                if chunk: yield chunk
+            try:
+                for chunk in upstream.iter_content(chunk_size=65536):
+                    if chunk: yield chunk
+            finally:
+                # Cierra la conexion upstream al cambiar de pista/video o al terminar.
+                # Sin esto, cada navegacion dejaba una conexion colgada y el servidor
+                # del telefono se saturaba (= "no carga mas despues de 2-3 videos").
+                try: upstream.close()
+                except Exception: pass
 
         return Response(stream_with_context(generate()),
                         status=upstream.status_code, headers=resp_hdrs)
@@ -815,8 +888,15 @@ def api_vstream(vid):
         if "Content-Length" in upstream.headers:
             resp_hdrs["Content-Length"] = upstream.headers["Content-Length"]
         def generate():
-            for chunk in upstream.iter_content(chunk_size=65536):
-                if chunk: yield chunk
+            try:
+                for chunk in upstream.iter_content(chunk_size=65536):
+                    if chunk: yield chunk
+            finally:
+                # Cierra la conexion upstream al cambiar de pista/video o al terminar.
+                # Sin esto, cada navegacion dejaba una conexion colgada y el servidor
+                # del telefono se saturaba (= "no carga mas despues de 2-3 videos").
+                try: upstream.close()
+                except Exception: pass
         return Response(stream_with_context(generate()),
                         status=upstream.status_code, headers=resp_hdrs)
     except Exception as e:
@@ -877,11 +957,25 @@ def api_lyrics():
         return jsonify({"has_synced": False, "synced": "", "plain": ""})
     return jsonify(get_lyrics(title, artist, dur))
 
+def _best_thumb(thumbs, fallback=""):
+    """Portada CUADRADA real que da YT Music (no el frame 16:9 del video).
+    Sube la resolucion del arte de Google para que no se vea borroso en grande."""
+    if not thumbs:
+        return fallback
+    url = (thumbs[-1] or {}).get("url", "") or fallback
+    if url:
+        url = re.sub(r"=w\d+-h\d+", "=w544-h544", url)
+        url = re.sub(r"/(?:w|s)\d+-h\d+/", "/w544-h544/", url)
+    return url or fallback
+
 def _ytm_track(s, fallback_thumb=""):
     vid = s.get("videoId")
     if not vid:
         return None
-    thumb = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+    # Portada cuadrada real (thumbnails de la cancion) -> si no, la del album -> y
+    # como ultimo recurso el frame del video. Asi se ve alineado como en YT Music.
+    thumb = _best_thumb(s.get("thumbnails"),
+                        fallback_thumb or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
     arts = s.get("artists") or []
     channel = ", ".join(a.get("name", "") for a in arts if a.get("name")) if arts else (s.get("author") or "")
     dsec = s.get("duration_seconds") or 0
@@ -956,6 +1050,11 @@ def api_artist():
                     t = _ytm_track(s)
                     if t:
                         songs.append(t)
+                # Si el artista no trae canciones (solo albumes/sencillos), rellena con
+                # una busqueda de MUSICA por su nombre; do_search cae a video solo si
+                # no hay ninguna cancion. Asi nunca queda vacio y la musica va primero.
+                if not songs:
+                    songs = do_search(name, 0).get("results", [])
                 thumb = (a.get("thumbnails") or [{}])[-1].get("url", "") or thumb0
                 return jsonify({
                     "name": a.get("name", name), "thumb": thumb,
@@ -968,6 +1067,9 @@ def api_artist():
                 })
         except Exception as e:
             print("[artist] ytmusic fallo:", e)
+    # Fallback: do_search ya prioriza MUSICA (canciones de YT Music) y solo cae a
+    # videos de YouTube si no hay ninguna cancion. Asi la ficha del artista muestra
+    # musica siempre que se pueda, y videos nada mas como ultimo recurso.
     d = do_search(name, 0)
     return jsonify({"name": name, "thumb": "", "desc": "", "subs": "",
                     "songs": d.get("results", []), "albums": [], "singles": [],
@@ -992,6 +1094,48 @@ def api_album():
                         "year": a.get("year", ""), "tracks": tracks})
     except Exception as e:
         return jsonify({"error": str(e)[:120]}), 502
+
+# -- VIDEO OFICIAL (como YT Music: audio -> cambiar al video musical real) ----
+# Cuando una pista es de MUSICA (portada estatica), aqui se busca su VIDEO musical
+# oficial (seccion "videos" de YT Music = los clips reales donde se les ve cantando).
+# Si no existe uno distinto, se devuelve el mismo id (se queda la portada).
+_mv_cache: dict = {}
+@app.route("/api/official_video")
+def api_official_video():
+    title  = request.args.get("title", "").strip()
+    artist = request.args.get("artist", "").strip()
+    cur    = request.args.get("id", "").strip()
+    q = (title + " " + artist).strip()
+    if not q:
+        return jsonify({"id": cur, "found": False})
+    ck = q.lower()
+    if ck in _mv_cache:
+        vid = _mv_cache[ck]
+        return jsonify({"id": vid or cur, "found": bool(vid and vid != cur)})
+    vid = ""
+    # 1) ytmusicapi -> seccion VIDEOS (videos musicales oficiales)
+    if _ytm is not None:
+        try:
+            for e in _ytm.search(q, filter="videos", limit=5):
+                v = e.get("videoId")
+                if v:
+                    vid = v
+                    break
+        except Exception:
+            vid = ""
+    # 2) fallback yt-dlp: "<cancion> official video"
+    if not vid:
+        try:
+            opts = {**_base(), "extract_flat": True, "playlistend": 1}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"ytsearch1:{q} official video", download=False)
+            ents = info.get("entries") or []
+            if ents and ents[0].get("id"):
+                vid = ents[0]["id"]
+        except Exception:
+            vid = ""
+    _mv_cache[ck] = vid
+    return jsonify({"id": vid or cur, "found": bool(vid and vid != cur)})
 
 @app.route("/api/search")
 def api_search():
@@ -1153,7 +1297,7 @@ def api_pl_rm_track(plid,tid): pl_remove_track(plid,tid); return jsonify({"ok":T
 
 # -- CONFIG ----------------------------------------
 @app.route("/api/config")
-def api_cfg_get(): return jsonify(cfg)
+def api_cfg_get(): return jsonify({**cfg, "ffmpeg": FFMPEG_OK})
 
 @app.route("/api/config", methods=["POST"])
 def api_cfg_set():
@@ -1191,7 +1335,135 @@ UI = r"""<!DOCTYPE html>
   --red:#e53935;--rd2:#ff6659;--grn:#1db954;--ylw:#ffd600;
   --bar:82px;--hdr:52px;
 }
-html,body{height:100%;overflow:hidden;-webkit-tap-highlight-color:transparent;user-select:none}
+
+/* ===== TEMAS (redefinen las variables de color de :root) ===== */
+/* Rojo = estilo YouTube Music */
+[data-theme="red"]{
+  --bg:#0f0f0f;--s1:#1a1a1a;--s2:#212121;--s3:#2a2a2a;--s4:#343434;--s5:#3f3f3f;
+  --bd:#303030;--red:#ff0033;--rd2:#ff5a5f;
+}
+/* Verde */
+[data-theme="green"]{
+  --bg:#121212;--s1:#181818;--s2:#1e1e1e;--s3:#282828;--s4:#333;--s5:#404040;
+  --bd:#2a2a2a;--red:#1db954;--rd2:#1ed760;--grn:#1db954;
+}
+/* Gris (grafito + acento plata) */
+[data-theme="gray"]{
+  --bg:#1a1a1c;--s1:#242426;--s2:#2c2c2e;--s3:#3a3a3c;--s4:#48484a;--s5:#5a5a5c;
+  --bd:#38383a;--tx:#f5f5f7;--t2:#9a9aa0;--red:#8e8e93;--rd2:#c7c7cc;
+}
+/* Verde: tarjetas/pildoras mas redondeadas */
+[data-theme="green"] .card,[data-theme="green"] .acard,[data-theme="green"] .shcard,[data-theme="green"] .plshc{border-radius:10px}
+[data-theme="green"] .chip,[data-theme="green"] .ob{border-radius:22px}
+/* Gris: barras y cabecera un pelin mas suaves */
+[data-theme="gray"] .srow,[data-theme="gray"] .qrow{border-radius:10px}
+
+/* Selector de tema (premium) */
+.theme-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.theme-opt{display:flex;flex-direction:column;align-items:center;gap:7px;padding:11px 6px;border-radius:13px;
+  background:var(--s2);border:1.5px solid transparent;color:var(--t2);font-size:12px;font-weight:600;cursor:pointer;
+  transition:border-color .18s,background .18s,color .18s,transform .12s}
+.theme-opt .theme-sw{width:26px;height:26px;border-radius:50%;box-shadow:0 2px 8px #0007;border:2px solid rgba(255,255,255,.14)}
+.theme-opt.on{border-color:var(--rd2);color:var(--tx);background:var(--s3)}
+.theme-opt:active{transform:scale(.94)}
+.logo-mark{width:21px;height:21px;color:var(--rd2);flex-shrink:0;filter:drop-shadow(0 1px 3px #0006)}
+
+/* ===== Navegacion inferior compartida (Verde + Gris) ===== */
+[data-theme="green"] body,[data-theme="gray"] body{padding-bottom:58px}
+[data-theme="green"] .tabs,[data-theme="gray"] .tabs{
+  position:fixed;left:0;right:0;bottom:0;top:auto;height:58px;z-index:95;
+  padding:0 2px;justify-content:space-around;align-items:center;overflow:visible;border-bottom:none}
+[data-theme="green"] .tab,[data-theme="gray"] .tab{
+  flex-direction:column;gap:3px;font-size:9.5px;font-weight:600;flex:1;max-width:88px;
+  padding:0;justify-content:center;text-align:center;border-bottom:none;color:var(--t2);transition:color .2s ease}
+[data-theme="green"] .tab .ic,[data-theme="gray"] .tab .ic{width:22px;height:22px;margin:0;
+  transition:transform .22s cubic-bezier(.3,1.5,.5,1)}
+[data-theme="green"] .tab.on,[data-theme="gray"] .tab.on{border-bottom:none}
+[data-theme="green"] .tab.on .ic,[data-theme="gray"] .tab.on .ic{transform:scale(1.1)}
+[data-theme="green"] #player,[data-theme="gray"] #player{margin:0 8px 6px;width:calc(100% - 16px)}
+
+/* ----- Verde ----- */
+[data-theme="green"] header{background:#0a0a0a;border-bottom:none}
+[data-theme="green"] .tabs{background:#0a0a0a;border-top:1px solid #1c1c1c}
+[data-theme="green"] .tab.on{color:#fff}
+[data-theme="green"] .tab.on .ic{color:#1ed760}
+[data-theme="green"] #player{border-radius:10px;border:1px solid #2a2a2a;background:#181818}
+[data-theme="green"] .sb{border-radius:22px}
+
+/* ----- Gris: barras translucidas (frosted), titulos grandes, acento plata ----- */
+[data-theme="gray"] header{background:rgba(26,26,28,.78);backdrop-filter:blur(22px) saturate(1.4);-webkit-backdrop-filter:blur(22px) saturate(1.4);border-bottom:1px solid rgba(255,255,255,.07)}
+[data-theme="gray"] .tabs{background:rgba(22,22,24,.82);backdrop-filter:blur(24px) saturate(1.4);-webkit-backdrop-filter:blur(24px) saturate(1.4);border-top:1px solid rgba(255,255,255,.09)}
+[data-theme="gray"] .tab.on{color:var(--rd2)}
+[data-theme="gray"] .sch h2,[data-theme="gray"] .pl-hdr h2{font-size:21px;font-weight:800;letter-spacing:-.5px}
+[data-theme="gray"] #player{border-radius:15px;border:1px solid rgba(255,255,255,.08);background:rgba(44,44,46,.82);backdrop-filter:blur(22px) saturate(1.3);-webkit-backdrop-filter:blur(22px) saturate(1.3)}
+[data-theme="gray"] .card,[data-theme="gray"] .acard,[data-theme="gray"] .shcard,[data-theme="gray"] .plshc,[data-theme="gray"] .srow{border-radius:12px}
+[data-theme="gray"] .sb{border-radius:12px;background:rgba(118,118,128,.22)}
+
+/* ======================================================================
+   PULIDO COMERCIAL POR TEMA  (detalles que hacen que cada uno "se sienta"
+   como la app real, no solo un cambio de color)
+   ====================================================================== */
+
+/* ----- VERDE ----- */
+/* Barra de busqueda BLANCA con pildora completa: el detalle mas reconocible */
+[data-theme="green"] .sb{background:#fff;border:1.5px solid #fff;border-radius:500px}
+[data-theme="green"] .sb:focus-within{border-color:#fff}
+[data-theme="green"] .sb input{color:#121212;font-weight:600;letter-spacing:-.1px}
+[data-theme="green"] .sb input::placeholder{color:#565656;font-weight:600}
+[data-theme="green"] .sb button{color:#121212}
+/* Titulos de seccion compactos y con mucho peso, tracking apretado */
+[data-theme="green"] .sch h2,[data-theme="green"] .pl-hdr h2{font-size:17px;font-weight:800;letter-spacing:-.4px}
+[data-theme="green"] .acard .an{font-weight:700;letter-spacing:-.2px;font-size:13.5px}
+[data-theme="green"] .acard .ay{font-size:11.5px}
+[data-theme="green"] .sr-ti{font-weight:600;letter-spacing:-.1px}
+/* Caratulas de cancion con esquina minima (casi cuadradas), como el listado de Spotify */
+[data-theme="green"] .srow .art{border-radius:5px}
+/* El artista del shelf: avatar circular con nombre centrado y en negrita */
+[data-theme="green"] .artc .an{font-weight:700}
+
+/* ----- GRIS ----- */
+/* Tipografia grande y redonda estilo SF: titulos XL, tracking negativo */
+[data-theme="gray"] .sch h2,[data-theme="gray"] .pl-hdr h2{font-size:23px;font-weight:800;letter-spacing:-.6px}
+[data-theme="gray"] .acard .an{font-weight:600;letter-spacing:-.2px;font-size:13.5px}
+[data-theme="gray"] .sr-ti{font-weight:600;letter-spacing:-.2px;font-size:15.5px}
+[data-theme="gray"] .sr-ar{letter-spacing:-.1px}
+/* Caratulas con esquina suave y sombra tenue (tarjetas tipo Apple Music) */
+[data-theme="gray"] .srow .art{border-radius:7px}
+[data-theme="gray"] .acard .aw{border-radius:9px;box-shadow:0 6px 18px #0009}
+/* Separadores de seccion con mas aire, como las listas de Apple */
+[data-theme="gray"] .sch{margin-top:6px}
+/* Gris: la LINEA DE REPRODUCCION en azul claro tipo Apple Music.
+   El relleno base usa --red (plata) y ademas lleva un halo rojo fijo (#skFill box-shadow)
+   que se colaba como "tono rojizo"; aqui ambos pasan a azul claro. */
+[data-theme="gray"] .sk-fill,[data-theme="gray"] .np-fill,[data-theme="gray"] .vc-fill{background:linear-gradient(90deg,#64c8ff,#3f9bf5)}
+[data-theme="gray"] #skFill,[data-theme="gray"] #npFill,[data-theme="gray"] .vc-fill{box-shadow:0 0 9px rgba(80,170,255,.55)}
+[data-theme="gray"] .sk-hdl,[data-theme="gray"] .np-hdl{background:#eef7ff}
+/* Azul tenue solo en la pestana activa y el foco del buscador (nada de rojo) */
+[data-theme="gray"] .tab.on::after{box-shadow:0 1px 6px rgba(80,170,255,.5)}
+[data-theme="gray"] .sb:focus-within{box-shadow:0 0 0 3px rgba(80,170,255,.18)}
+
+/* ----- El avatar de ARTISTA siempre es un circulo (sello comun de Spotify y Apple) -----
+   Va al final a proposito: asi gana en especificidad/orden a .acard .aw de cada tema */
+.acard.artc .aw{border-radius:50%!important;box-shadow:0 4px 16px #000a}
+.acard.artc .aw-ph{border-radius:50%}
+[data-theme="gray"] .acard.artc .aw{box-shadow:0 6px 18px #000a}
+
+/* ===== Pantallas grandes / tablets: contenido centrado, mas columnas, se ve intencional ===== */
+@media (min-width:820px){
+  .panel{max-width:1120px;margin-left:auto;margin-right:auto;width:100%;padding-left:24px;padding-right:24px}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:14px}
+  /* reproductor flotante centrado (Verde/Gris) en pantallas anchas */
+  [data-theme="green"] #player,[data-theme="gray"] #player{max-width:1120px;margin-left:auto;margin-right:auto}
+  /* la nav inferior reparte los items con mas aire */
+  [data-theme="green"] .tab,[data-theme="gray"] .tab{max-width:120px}
+}
+@media (min-width:1200px){
+  .panel{max-width:1320px}
+  [data-theme="green"] #player,[data-theme="gray"] #player{max-width:1320px}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(185px,1fr))}
+}
+html,/* antialias + optimizeLegibility: texto mas nitido y uniforme en WebView */
+body{height:100%;overflow:hidden;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility}
 body{font-family:-apple-system,"Segoe UI",Roboto,sans-serif;
      background:var(--bg);color:var(--tx);display:flex;flex-direction:column}
 ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:var(--s4);border-radius:3px}
@@ -1257,6 +1529,8 @@ header{height:var(--hdr);min-height:var(--hdr);background:var(--s1);
 .sch h2{font-size:15px;font-weight:700}
 .sch small{font-size:11px;color:var(--t2)}
 .ssep{margin-bottom:20px}
+.artc .aw{border-radius:50%}
+.artc .an{text-align:center}
 
 /* GRID */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:10px}
@@ -1296,6 +1570,10 @@ header{height:var(--hdr);min-height:var(--hdr);background:var(--s1);
 .chip{background:var(--s3);border:1px solid var(--bd);color:var(--t2);
   padding:5px 12px;border-radius:16px;font-size:12px;transition:all .15s;white-space:nowrap}
 .chip:hover{background:var(--red);border-color:var(--red);color:#fff}
+/* Chip activo (filtros de busqueda): relleno con el acento del tema */
+.chips.sfil{position:sticky;top:0;z-index:4;padding:8px 0;margin-bottom:10px;background:var(--bg)}
+.chip.on{background:var(--red);border-color:var(--red);color:#fff;font-weight:700}
+[data-theme="gray"] .chip.on{background:#3f9bf5;border-color:#3f9bf5}
 
 /* PAGER */
 .pager{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:14px}
@@ -1398,7 +1676,8 @@ header{height:var(--hdr);min-height:var(--hdr);background:var(--s1);
 .part-ph{display:flex;align-items:center;justify-content:center;font-size:17px}
 .pmeta{flex:1;min-width:0}
 .ptit{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.pch{font-size:11px;color:var(--t2)}
+/* una sola linea + ellipsis: impide wrap que reacomoda la barra de altura fija y el overflow horizontal */
+.pch{font-size:11px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pctrl{display:flex;align-items:center;gap:2px;flex-shrink:0}
 #brep.on{color:var(--rd2)}#brep.on:hover{color:var(--rd2)}
 .bc{color:var(--t2);width:30px;height:30px;border-radius:50%;font-size:14px;
@@ -1409,7 +1688,7 @@ header{height:var(--hdr);min-height:var(--hdr);background:var(--s1);
 .bc .ic{width:1.15em;height:1.15em;pointer-events:none}
 .bc.main{box-shadow:0 4px 14px #0007;transition:transform .12s ease,background .15s ease}
 .bc.main .ic{width:21px;height:21px;fill:#fff}
-.bc.main .ic.play-ic{transform:translateX(1px)}
+.bc.main .ic.play-ic{transform:translateX(-.5px)}
 .bc.main:hover{transform:scale(1.06)}.bc.main:active{transform:scale(.9)}
 .bpp .ic{width:1.5em;height:1.5em}
 .spin{animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
@@ -1463,9 +1742,9 @@ header{height:var(--hdr);min-height:var(--hdr);background:var(--s1);
 /* TOASTS */
 #toasts{position:fixed;bottom:calc(var(--bar)+8px);right:10px;
   display:flex;flex-direction:column;gap:5px;z-index:300;pointer-events:none}
-.tst{background:#252525;color:var(--tx);border-radius:8px;padding:9px 14px;
-  font-size:12px;max-width:280px;box-shadow:0 4px 16px #0009;
-  animation:ti .2s ease,to .2s ease 2.8s forwards}
+.tst{background:rgba(30,30,34,.9);backdrop-filter:blur(16px) saturate(1.3);-webkit-backdrop-filter:blur(16px) saturate(1.3);
+  color:#fff;border-radius:13px;padding:11px 15px;font-size:13px;font-weight:500;max-width:300px;line-height:1.35;
+  border-left:3px solid var(--rd2)}
 @keyframes ti{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 @keyframes to{to{opacity:0;transform:translateY(-5px)}}
 
@@ -1514,6 +1793,8 @@ header{height:var(--hdr);min-height:var(--hdr);background:var(--s1);
 .art-hn{font-size:22px;font-weight:800;color:var(--tx);line-height:1.15}
 .art-hs{font-size:12px;color:var(--t2);margin-top:4px}
 .agrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:14px;padding:4px 0 10px}
+/* .acard dentro de un shelf horizontal: ancho fijo + no encoger */
+.shelf .acard{flex:0 0 auto;width:140px;scroll-snap-align:start}
 .acard{cursor:pointer;transition:transform .15s}
 .acard:hover{transform:translateY(-3px)}
 .acard img{width:100%;aspect-ratio:1;border-radius:10px;object-fit:cover;background:var(--s2);
@@ -1523,6 +1804,18 @@ header{height:var(--hdr);min-height:var(--hdr);background:var(--s1);
 .acard .ay{font-size:11px;color:var(--t2);margin-top:1px}
 /* ═══════════ POLISH / ESTÉTICA COMERCIAL ═══════════ */
 :root{--rdg:linear-gradient(135deg,#ff5e57,#e5143a)}
+/* Acento (gradiente) por tema: debe ir DESPUES del :root --rdg de arriba */
+[data-theme="red"]{--rdg:linear-gradient(135deg,#ff5a5f,#ff0033)}
+[data-theme="green"]{--rdg:linear-gradient(135deg,#1ed760,#1db954)}
+[data-theme="gray"]{--rdg:linear-gradient(135deg,#b0b0b5,#7c7c82)}
+[data-theme="red"] .bc.main{box-shadow:0 6px 20px rgba(255,0,51,.45),0 2px 6px #0007}
+[data-theme="green"] .bc.main{box-shadow:0 6px 20px rgba(29,185,84,.45),0 2px 6px #0007}
+[data-theme="gray"] .bc.main{box-shadow:0 6px 20px rgba(142,142,147,.4),0 2px 6px #0007}
+[data-theme="red"] .logo-dot{box-shadow:0 0 12px #ff003399}
+[data-theme="green"] .logo-dot{box-shadow:0 0 12px #1db95499}
+[data-theme="gray"] .logo-dot{box-shadow:0 0 12px #8e8e9399}
+[data-theme="green"] .srow.active{background:linear-gradient(90deg,rgba(29,185,84,.16),rgba(29,185,84,.04) 55%,transparent)}
+[data-theme="gray"] .srow.active{background:linear-gradient(90deg,rgba(142,142,147,.18),rgba(142,142,147,.05) 55%,transparent)}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,system-ui,sans-serif;
   -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
 header{backdrop-filter:blur(14px);background:rgba(18,18,18,.82)}
@@ -1572,6 +1865,13 @@ header{backdrop-filter:blur(14px);background:rgba(18,18,18,.82)}
   opacity:0;transition:opacity .45s;border-radius:0}
 .acard img.ld{opacity:1}
 .art-av{opacity:0;transition:opacity .4s}.art-av.ld{opacity:1}
+/* Placeholder cuando la caratula no carga (artista sin foto, album sin arte): en vez de un
+   cuadro negro vacio se ve un icono sobre un degradado suave, como las apps comerciales */
+.aw-ph{position:absolute;inset:0;z-index:3;display:none;align-items:center;justify-content:center;
+  color:var(--t2);background:linear-gradient(145deg,var(--s4),var(--s2))}
+.aw-ph .ic{width:42%;height:42%;opacity:.55}
+.acard .aw.noimg::before{animation:none!important;background:none}
+.acard .aw.noimg .aw-ph{display:flex}
 /* responsive */
 @media(max-width:560px){
   .grid{grid-template-columns:repeat(2,1fr);gap:11px}
@@ -1614,7 +1914,7 @@ header{backdrop-filter:blur(14px);background:rgba(18,18,18,.82)}
   display:flex;align-items:center;justify-content:center;color:#fff;
   box-shadow:0 8px 28px #0007;transition:transform .13s ease,background .15s}
 .vc-big:hover{background:#ffffff3a}.vc-big:active{transform:scale(.88)}
-.vc-big .ic{width:34px;height:34px;fill:#fff}.vc-big .ic.play-ic{transform:translateX(2px)}
+.vc-big .ic{width:34px;height:34px;fill:#fff}.vc-big .ic.play-ic{transform:translateX(-1px)}
 .vc-mini{width:48px;height:48px;border-radius:50%;color:#fff;display:flex;align-items:center;
   justify-content:center;background:#ffffff14;transition:transform .13s ease,background .15s}
 .vc-mini:hover{background:#ffffff26}.vc-mini:active{transform:scale(.86)}.vc-mini .ic{width:27px;height:27px}
@@ -1637,7 +1937,7 @@ header{backdrop-filter:blur(14px);background:rgba(18,18,18,.82)}
 @media(max-width:560px){.vc-center{gap:26px}.vc-big{width:64px;height:64px}.vc-big .ic{width:30px;height:30px}
   .vc-mini{width:44px;height:44px}}
 #np{position:fixed;inset:0;z-index:110;background:var(--bg);
-  transform:translateY(100%);transition:transform .38s cubic-bezier(.33,0,.1,1);
+  transform:translateY(100%);transition:transform .38s cubic-bezier(.33,0,.1,1);will-change:transform;backface-visibility:hidden;
   display:flex;flex-direction:column;overflow:hidden}
 #np.show{transform:translateY(0)}
 .np-bg{position:absolute;inset:0;background-size:cover;background-position:center;
@@ -1661,7 +1961,8 @@ header{backdrop-filter:blur(14px);background:rgba(18,18,18,.82)}
 .np-meta{padding:6px 2px 2px}
 .np-title{font-size:22px;font-weight:800;letter-spacing:-.5px;line-height:1.2;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.np-artist{font-size:14px;color:var(--t2);margin-top:5px;font-weight:500;cursor:pointer;display:inline-block}
+/* block + max-width + ellipsis: evita que un artista largo se salga del panel */
+.np-artist{font-size:14px;color:var(--t2);margin-top:5px;font-weight:500;cursor:pointer;display:block;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .np-artist:active{color:var(--tx)}
 .np-seek{padding:16px 0 4px}
 .np-sk{height:22px;display:flex;align-items:center;cursor:pointer;position:relative;touch-action:none}
@@ -1680,7 +1981,7 @@ header{backdrop-filter:blur(14px);background:rgba(18,18,18,.82)}
 .np-cb:hover{background:#ffffff12}.np-cb:active{transform:scale(.86)}.np-cb .ic{width:32px;height:32px;fill:currentColor}
 .np-play{width:68px;height:68px;border-radius:50%;background:var(--rdg);color:#fff;display:flex;align-items:center;
   justify-content:center;box-shadow:0 8px 26px #e5143a66;transition:transform .12s}
-.np-play:active{transform:scale(.9)}.np-play .ic{width:30px;height:30px;fill:#fff}.np-play .ic.play-ic{transform:translateX(2px)}
+.np-play:active{transform:scale(.9)}.np-play .ic{width:30px;height:30px;fill:#fff}.np-play .ic.play-ic{transform:translateX(-1px)}
 .np-like,.np-kar{width:48px;height:48px;border-radius:50%;color:var(--t2);display:flex;align-items:center;
   justify-content:center;transition:color .15s,transform .12s}
 .np-like:active,.np-kar:active{transform:scale(.85)}.np-like .ic,.np-kar .ic{width:25px;height:25px}
@@ -1782,6 +2083,15 @@ header{backdrop-filter:blur(14px);background:rgba(18,18,18,.82)}
 .bc.main{box-shadow:0 6px 20px rgba(229,57,53,.45),0 2px 6px #0007}
 .bc.main:hover{box-shadow:0 9px 28px rgba(229,57,53,.58),0 2px 6px #0007;transform:scale(1.07)}
 .bc.main:active{transform:scale(.9)}
+/* ===== Play/pausa SIN halo de color (va al final para ganar a todos los temas) =====
+   Antes el boton llevaba un brillo de color (rojo/verde/plata) que al pasar el mouse
+   crecia y en la vista de portada se notaba un aro alrededor. Ahora solo una sombra
+   neutra y discreta, igual en reposo y en hover: limpio, nivel comercial. */
+.bc.main,
+[data-theme="red"] .bc.main,[data-theme="green"] .bc.main,[data-theme="gray"] .bc.main{box-shadow:0 2px 9px rgba(0,0,0,.42)}
+.bc.main:hover{box-shadow:0 2px 9px rgba(0,0,0,.42)}
+.np-play,[data-theme="gray"] .np-play{box-shadow:0 3px 12px rgba(0,0,0,.4)}
+.bpp{box-shadow:none}
 #bvid.on,#bkar.on{color:var(--red)}
 .tab{position:relative;transition:color .18s ease}
 .tab.on::after{content:"";position:absolute;left:11px;right:11px;bottom:0;height:2.5px;border-radius:3px;background:var(--rdg);box-shadow:0 1px 6px rgba(229,57,53,.5)}
@@ -1800,7 +2110,9 @@ header{backdrop-filter:blur(14px);background:rgba(18,18,18,.82)}
 .cfg-save:active{transform:scale(.97)}
 .sb{transition:border-color .2s ease,box-shadow .2s ease}
 .sb:focus-within{box-shadow:0 0 0 3px rgba(229,57,53,.16)}
-.tst{box-shadow:0 8px 28px #000a;border:1px solid var(--bd)}
+.tst{box-shadow:0 12px 36px rgba(0,0,0,.5),0 2px 10px rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.08)}
+.tst.ok{border-left-color:#2ec27e}.tst.err{border-left-color:#ff5a63}.tst.dl{border-left-color:#4aa3ff}
+.tst.ok .tst-i{color:#2ec27e}.tst.err .tst-i{color:#ff6b72}.tst.dl .tst-i{color:#6cb6ff}
 .lk .ic,.bc.on .ic{filter:drop-shadow(0 0 5px rgba(255,214,0,.5))}
 button{-webkit-tap-highlight-color:transparent}
 
@@ -1881,7 +2193,8 @@ button{-webkit-tap-highlight-color:transparent}
 
 /* toasts con entrada mas viva */
 @keyframes tstIn{from{opacity:0;transform:translateY(16px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
-.tst{animation:tstIn .3s cubic-bezier(.2,.8,.3,1.1) both}
+.tst{animation:tstIn .34s cubic-bezier(.2,.9,.25,1.25) both,tstOut .28s ease 2.95s forwards}
+@keyframes tstOut{to{opacity:0;transform:translateY(8px) scale(.98)}}
 
 /* ripple sutil al tocar renglon */
 .srow::after{content:"";position:absolute;inset:0;border-radius:12px;background:radial-gradient(circle at center,rgba(255,255,255,.12),transparent 60%);opacity:0;transition:opacity .4s;pointer-events:none}
@@ -1942,13 +2255,27 @@ button{-webkit-tap-highlight-color:transparent}
   border-bottom:1px solid #4a1f1f;box-shadow:0 4px 16px #0007}
 #offbar.show{transform:translateY(0)}
 #offbar .ic{width:16px;height:16px;flex-shrink:0}
+@media (hover:none){
+  .srow:hover{background:transparent}
+  .qrow:hover{background:transparent}
+  .frow:hover{background:var(--s2)}
+  .card:hover{background:var(--s2);transform:none}
+  .pl-card:hover{background:var(--s2)}
+  .chip:hover{background:var(--s3);border-color:var(--bd);color:var(--t2)}
+  .acard:hover{transform:none}
+  .bc:hover{background:none;color:var(--t2)}
+  .hbtn:hover,.fbtn:hover,.pl-act:hover,.qrow-x:hover,.vc-ic:hover,.np-ic:hover,.np-cb:hover,.np-xb:hover,.kar-x:hover{background:none}
+  .shcard:hover .sh-art img,.plshc:hover .sh-art img{transform:none}
+  .main:hover{transform:none}
+  .bpp:hover{transform:none}
+}
 </style>
 </head>
 <body>
 
 <header>
   <a class="logo" href="#" onclick="showDash();return false">
-    <div class="logo-dot"></div>BeatStream
+    <svg class="logo-mark" viewBox="0 0 28 28" aria-hidden="true"><g fill="currentColor"><rect x="3" y="11" width="3.4" height="6" rx="1.7"/><rect x="9" y="7" width="3.4" height="14" rx="1.7"/><rect x="15" y="4" width="3.4" height="20" rx="1.7"/><rect x="21.5" y="9" width="3.4" height="10" rx="1.7"/></g></svg>BeatStream
   </a>
   <div class="sb">
     <input id="qi" type="text" placeholder="Artista, canción, álbum…"
@@ -2112,6 +2439,15 @@ button{-webkit-tap-highlight-color:transparent}
 <div id="cfgM">
   <div class="cfg-box">
     <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> Configuración <button onclick="closeCfg()">✕</button></h2>
+
+    <div class="cfg-sec">
+      <label>Tema</label>
+      <div class="theme-grid">
+        <button class="theme-opt" data-theme="normal" onclick="setTheme('normal')"><span class="theme-sw" style="background:linear-gradient(135deg,#ff5e57,#e5143a)"></span>Normal</button>
+        <button class="theme-opt" data-theme="green" onclick="setTheme('green')"><span class="theme-sw" style="background:#1db954"></span>Verde</button>
+        <button class="theme-opt" data-theme="gray" onclick="setTheme('gray')"><span class="theme-sw" style="background:#c7c7cc"></span>Gris</button>
+      </div>
+    </div>
 
     <div class="cfg-sec">
       <label>Modo de descarga</label>
@@ -2296,14 +2632,37 @@ function _natUrl(t){
   return location.origin+'/api/stream/'+t.id;
 }
 function _natArt(t){
+  if(t.thumb)return t.thumb;   // portada cuadrada real (YT Music) para la notificacion
   const v=t.id||'';
   if(v&&!t.local&&String(v).indexOf('local:')!==0)return 'https://i.ytimg.com/vi/'+v+'/hqdefault.jpg';
-  return t.thumb||'';
+  return '';
 }
 function _natItem(t){return {url:_natUrl(t),title:t.title||'',artist:t.channel||t.artist||'',art:_natArt(t)};}
 function _pushNativeQueue(idx){try{AndroidBG.setQueue(JSON.stringify(Q.map(_natItem)),idx);AndroidBG.setRepeat(RPT);}catch(e){}}
 function _pushLocalNative(idx){try{AndroidBG.setQueue(JSON.stringify(LQ.map(function(f){return {url:location.origin+'/sandbox/'+encodeURIComponent(f.name),title:f.title||f.name,artist:f.artist||'Local',art:f.thumb||''};})),idx);AndroidBG.setRepeat(RPT);}catch(e){}}
 function _natAppend(tracks){try{AndroidBG.addItems(JSON.stringify(tracks.map(_natItem)));}catch(e){}}
+function _natResumeFromVideo(posSec){
+  if(!NATIVE)return;
+  const ms=Math.round((posSec||0)*1000);
+  try{
+    if(MODE==='local'){
+      const idx=lqi<0?0:lqi;
+      AndroidBG.setQueuePos(JSON.stringify(LQ.map(function(f){return {url:location.origin+'/sandbox/'+encodeURIComponent(f.name),title:f.title||f.name,artist:f.artist||'Local',art:f.thumb||''};})),idx,ms);
+      _natLastIdx=idx;
+    }else{
+      // Reanuda EXACTO la pista que estaba en el VIDEO (guardada aparte, inmune a
+      // cualquier reseteo de qi/curTrack). Si por algo no esta en Q, se antepone.
+      const vt=window._curVidTrack||curTrack;
+      let idx=vt?Q.findIndex(function(t){return t&&t.id===vt.id;}):-1;
+      if(idx<0&&vt){Q=[vt].concat(Q.filter(function(t){return t&&t.id!==vt.id;}));idx=0;}
+      if(idx<0)idx=qi<0?0:qi;
+      qi=idx;if(vt)curTrack=vt;
+      AndroidBG.setQueuePos(JSON.stringify(Q.map(_natItem)),idx,ms);
+      _natLastIdx=idx;
+    }
+    AndroidBG.setRepeat(RPT);
+  }catch(e){}
+}
 
 let _natLastIdx=-1;
 function _onNativeTrack(i){
@@ -2319,7 +2678,7 @@ function _onNativeTrack(i){
   }
   if(i<0||i>=Q.length)return;
   if(_natLastIdx>=0&&i>_natLastIdx&&Q[_natLastIdx])_feedback(Q[_natLastIdx],'complete');
-  qi=i;const t=Q[i];curTrack=t;
+  qi=i;const t=Q[i];curTrack=t;_natRetry=0;
   hlCard(t.id);
   setMeta(t.title,t.channel,t.thumb,false);
   setMediaMeta(t);
@@ -2333,11 +2692,11 @@ function _onNativeTrack(i){
 }
 
 if(NATIVE){
-  const L={};let _ct=0,_dur=0,_paused=true,_rs=0,_src='',_vol=1;
+  const L={};let _ct=0,_dur=0,_paused=true,_rs=0,_src='',_vol=1,_posAt=0;
   function fire(type){(L[type]||[]).slice().forEach(function(o){try{o.fn({type:type});}catch(e){}});if(L[type])L[type]=L[type].filter(function(o){return !o.once;});}
   MA={
-    get currentTime(){return _ct;},
-    set currentTime(v){_ct=v;try{AndroidBG.seekTo(Math.round(v*1000));}catch(e){}},
+    get currentTime(){if(_paused)return _ct;var t=_ct+(performance.now()-_posAt)/1000;return (_dur>0&&t>_dur)?_dur:t;},
+    set currentTime(v){_ct=v;_posAt=performance.now();try{AndroidBG.seekTo(Math.round(v*1000));}catch(e){}},
     get duration(){return _dur;},
     get paused(){return _paused;},
     get ended(){return false;},
@@ -2353,12 +2712,12 @@ if(NATIVE){
     removeEventListener:function(t,fn){if(L[t])L[t]=L[t].filter(function(o){return o.fn!==fn;});}
   };
   window.BS={
-    state:function(p){_paused=!p;fire(p?'play':'pause');},
-    pos:function(ms,dur){_ct=(ms||0)/1000;if(dur&&dur>0)_dur=dur/1000;_rs=4;fire('timeupdate');},
+    state:function(p){if(!p&&!_paused){_ct=_ct+(performance.now()-_posAt)/1000;}_paused=!p;_posAt=performance.now();fire(p?'play':'pause');},
+    pos:function(ms,dur,i,cnt){if(window._vidOpen)return;_ct=(ms||0)/1000;_posAt=performance.now();if(dur&&dur>0)_dur=dur/1000;_rs=4;fire('timeupdate');if(typeof i==='number'&&i>=0){if(MODE==='local'){if(i!==lqi)_onNativeTrack(i);}else{if(i!==qi)_onNativeTrack(i);}}},
     ready:function(){_rs=4;fire('canplay');},
     waiting:function(){fire('waiting');},
-    track:function(i){_onNativeTrack(i);},
-    ended:function(){_paused=true;fire('pause');},
+    track:function(i){if(window._vidOpen)return;_onNativeTrack(i);},
+    ended:function(){_paused=true;fire('pause');document.querySelectorAll('[data-vid].active').forEach(function(c){c.classList.remove('active');});},
     needmore:function(){try{_ensureRadio();}catch(e){}},
     error:function(){fire('error');}
   };
@@ -2416,7 +2775,7 @@ MA.addEventListener('ended',()=>{
   if(curTrack)_feedback(curTrack,'complete');
   _playNextYT();
 });
-let _errCount=0;
+let _errCount=0,_natRetry=0;
 MA.addEventListener('canplay',()=>{_errCount=0;});
 MA.addEventListener('error',()=>{
   if(MA.muted)return;
@@ -2425,6 +2784,12 @@ MA.addEventListener('error',()=>{
   const msg=MA.error?.message||'';
   if(msg.toLowerCase().includes('abort'))return;
   if(MODE==='yt'&&Q.length>0){
+    if(NATIVE){
+      // Reintenta la MISMA pista antes de rendirse: un stream lento o un 403
+      // temporal no debe marcarse como "no disponible" ni saltarse.
+      if(_natRetry<3){_natRetry++;try{AndroidBG.retry();}catch(e){}toast('Reintentando…','dl');return;}
+      _natRetry=0;toast('No disponible, saltando…','err');try{AndroidBG.skipError();}catch(e){}return;
+    }
     _errCount++;
     if(_errCount<=8){toast('No disponible, saltando…','err');_playNextYT();return;}
     _errCount=0;
@@ -2565,6 +2930,19 @@ function _applyRepeat(){
   if(NATIVE){try{AndroidBG.setRepeat(RPT);}catch(e){}}
 }
 setTimeout(_applyRepeat,0);
+
+// ===== Temas: Normal / Verde / Gris =====
+const _THEME_BG={normal:'#0d0d0d',red:'#0f0f0f',green:'#121212',gray:'#1a1a1c'};
+function setTheme(t){
+  if(!_THEME_BG[t])t='normal';
+  if(t==='normal')document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme',t);
+  try{localStorage.setItem('bs_theme',t);}catch(e){}
+  document.querySelectorAll('.theme-opt').forEach(function(b){b.classList.toggle('on',b.dataset.theme===t);});
+  const m=document.querySelector('meta[name=theme-color]');if(m)m.content=_THEME_BG[t];
+}
+// Aplica el tema guardado al cargar (antes de que el usuario abra ajustes).
+(function(){try{setTheme(localStorage.getItem('bs_theme')||'normal');}catch(e){}})();
 G('bvid').onclick=()=>{
   if(!curTrack){toast('Reproduce algo primero');return;}
   if(MODE==='local'&&curTrack.is_video){openLocalVideo();return;}
@@ -2647,11 +3025,15 @@ function renderQueue(){
   box.innerHTML=h;
 }
 function qJump(i){ if(i>=0&&i<Q.length){playYT(i);renderQueue();} }
-function qRemove(i){ if(i>qi&&i<Q.length){Q.splice(i,1);renderQueue();} }
+function qRemove(i){ if(i>qi&&i<Q.length){Q.splice(i,1);if(NATIVE){try{AndroidBG.removeItem(i);}catch(e){}}renderQueue();} }
 
 function openNP(){
   if(!curTrack){toast('Reproduce algo primero');return;}
   _npSync();
+  // pinta el minuto REAL al abrir (evita que se vea en 0 y un toque salte al inicio)
+  const _d=MA.duration||0,_c=MA.currentTime||0,_f=_d>0?Math.min(1,_c/_d):0;
+  G('npFill').style.width=(_f*100)+'%';G('npHdl').style.left=(_f*100)+'%';
+  G('npNow').textContent=fmt(_c);if(G('npDur'))G('npDur').textContent=fmt(_d);
   G('npPlay').innerHTML=MA.paused?IC.play:IC.pause;
   G('np').classList.add('show');
 }
@@ -2693,11 +3075,43 @@ function npDownload(){
 })();
 
 function _vClosePanels(){try{closeNP();}catch(e){}try{closeQueue();}catch(e){}try{closeKaraoke();}catch(e){}try{closeCfg();}catch(e){}try{closeCtx();}catch(e){}}
+// Como YT Music: resuelve el VIDEO musical oficial de una pista de musica (el clip
+// real). Cachea en la propia pista para que alternar sea instantaneo la 2a vez. Si
+// no hay uno distinto, devuelve el mismo id (se ve la portada, como ahora).
+async function _resolveMV(t){
+  if(!t||!t.id)return (t&&t.id)||'';
+  if(t.local)return t.id;
+  if(t._mv)return t._mv;
+  try{
+    const u='/api/official_video?title='+encodeURIComponent(t.title||'')+
+            '&artist='+encodeURIComponent(t.channel||t.artist||'')+
+            '&id='+encodeURIComponent(t.id);
+    const d=await(await fetch(u)).json();
+    t._mv=(d&&d.id)||t.id;
+  }catch(e){t._mv=t.id;}
+  return t._mv;
+}
+// Mejora en 2o plano: el video YA esta cargando con el id original; cuando la busqueda
+// del video oficial responde, si hay uno distinto, cambia la fuente sin bloquear la
+// carga. Si el oficial fallara, vuelve al original (nunca deja la pantalla en negro).
+function _upgradeToMV(lv,t){
+  const forT=t, origErr=lv.onerror;
+  _resolveMV(t).then(vid=>{
+    if(curTrack!==forT||!vid||vid===t.id)return;      // cambio de pista o no hay MV
+    window._curVidStreamId=vid;
+    const keep=lv.currentTime||0;   // mantener el MISMO minuto: sincronia continua
+    lv.onerror=function(){ lv.onerror=origErr; window._curVidStreamId=t.id;
+      lv.src='/api/vstream/'+encodeURIComponent(t.id);
+      lv.addEventListener('loadedmetadata',function o(){lv.removeEventListener('loadedmetadata',o);try{lv.currentTime=keep;}catch(e){}lv.play().catch(()=>{});},{once:true}); };
+    lv.addEventListener('loadedmetadata',function o(){lv.removeEventListener('loadedmetadata',o);lv.onerror=origErr;try{lv.currentTime=keep;}catch(e){}lv.play().catch(()=>{});},{once:true});
+    lv.src='/api/vstream/'+encodeURIComponent(vid);
+  });
+}
 function openYTVideo(){
   if(!curTrack)return;
   const startSec=MA.currentTime||0;
   _vidIsLocal=false;
-  MA.muted=true;MA.pause();
+  if(NATIVE){try{AndroidBG.stop();}catch(e){}window._vidOpen=true;window._curVidTrack=curTrack;}else{MA.muted=true;MA.pause();}
   if(_ytPlayer){try{_ytPlayer.stopVideo();}catch(e){}}
   G('ytifr').style.display='none';
   const lv=G('localvid');
@@ -2705,6 +3119,9 @@ function openYTVideo(){
   G('vidLoad').classList.add('show');
   lv.onwaiting=()=>G('vidLoad').classList.add('show');
   lv.onplaying=()=>G('vidLoad').classList.remove('show');
+  // Carga YA el video (instantaneo, nunca se bloquea por la busqueda del oficial).
+  window._curVidStreamId=curTrack.id;
+  window._vidAudioStart=startSec;   // minuto del AUDIO al abrir (para reanudar bien al cerrar)
   lv.src='/api/vstream/'+encodeURIComponent(curTrack.id);
   lv.volume=parseInt(G('vol').value)/100;
   lv.muted=false;
@@ -2715,14 +3132,14 @@ function openYTVideo(){
   },{once:true});
   lv.onerror=()=>{G('vidLoad').classList.remove('show');toast('No se pudo cargar el video','err');};
   _vClosePanels();G('vidpanel').classList.add('show');_vBind();G('vcTitle').textContent=(curTrack.title||'Video');G('vcMute').innerHTML=G('localvid').muted?IC.mute:IC.vol;_vShow();_enterVidFS();
+  _upgradeToMV(lv,curTrack);   // y si existe el video oficial, cambia a el en 2o plano
 }
 
 function openLocalVideo(){
   if(!curTrack)return;
   const startSec=MA.currentTime||0;
   _vidIsLocal=true;
-  MA.muted=true;
-  MA.pause();
+  if(NATIVE){try{AndroidBG.stop();}catch(e){}window._vidOpen=true;window._curVidTrack=curTrack;}else{MA.muted=true;MA.pause();}
   // Destruye player YT si existe
   if(_ytPlayer){try{_ytPlayer.stopVideo();}catch(e){}}
   G('ytifr').style.display='none';
@@ -3009,25 +3426,38 @@ async function _videoNext(){
     const vidxs=LQ.map((f,i)=>i).filter(i=>LQ[i].is_video);
     if(vidxs.length<=1){closeVideo();return;}
     const pos=vidxs.indexOf(lqi);const nx=vidxs[(pos+1)%vidxs.length];
-    lqi=nx;const f=LQ[nx];curTrack={id:'local:'+f.name,...f};
+    lqi=nx;const f=LQ[nx];curTrack={id:'local:'+f.name,...f};window._curVidTrack=curTrack;
     setMeta(f.title||f.name.replace(/\.[^.]+$/,''),f.artist||'Local',null,true);
     const lv=G('localvid');G('vidLoad').classList.add('show');
     lv.src='/sandbox/'+encodeURIComponent(f.name);
     lv.addEventListener('loadedmetadata',function onM(){lv.removeEventListener('loadedmetadata',onM);lv.play().catch(()=>{});},{once:true});
     G('vcTitle').textContent=f.title||f.name;return;
   }
-  if(qi+1>=Q.length&&radioOn&&curTrack){await _ensureRadio();}
+  // En video, al llegar al final de la cola intentamos extender con radio aunque
+  // no estuviera activo, para que "siguiente" siga funcionando en vez de cerrar.
+  if(qi+1>=Q.length&&curTrack){radioOn=true;await _ensureRadio();}
   if(qi+1>=Q.length){closeVideo();return;}
   if(curTrack)_feedback(curTrack,'complete');
-  qi=qi+1;const t=Q[qi];curTrack=t;
+  qi=qi+1;const t=Q[qi];curTrack=t;window._curVidTrack=t;
   setMeta(t.title,t.channel,t.thumb,false);
   setLikeBtn(t.id,'yt');
   try{MA.src='/api/stream/'+t.id;MA.muted=true;MA.load();}catch(e){}
   fetch('/api/play',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(t)}).catch(()=>{});
   _ensureRadio();
   const lv=G('localvid');G('vidLoad').classList.add('show');lv.muted=false;
+  // Reset del decoder antes de cargar el siguiente: tras 2-3 videos el <video>
+  // se quedaba trabado y no aceptaba nuevas fuentes.
+  try{lv.pause();lv.removeAttribute('src');lv.load();}catch(e){}
+  // Si un video no carga, salta al siguiente en vez de atascarse (con tope para
+  // no entrar en bucle si varios fallan seguidos).
+  lv.onerror=function(){G('vidLoad').classList.remove('show');window._vFail=(window._vFail||0)+1;if(window._vFail<6){_videoNext();}else{window._vFail=0;toast('No se pudo cargar el video','err');closeVideo();}};
+  lv.addEventListener('loadedmetadata',function onM(){lv.removeEventListener('loadedmetadata',onM);window._vFail=0;lv.play().catch(()=>{});},{once:true});
+  // Carga YA el video de la pista (instantaneo) y, en 2o plano, si existe el video
+  // oficial (clip real), cambia a el sin bloquear la carga.
+  window._curVidStreamId=t.id;
+  window._vidAudioStart=0;   // pista nueva: su audio arranca desde el inicio
   lv.src='/api/vstream/'+encodeURIComponent(t.id);
-  lv.addEventListener('loadedmetadata',function onM(){lv.removeEventListener('loadedmetadata',onM);lv.play().catch(()=>{});},{once:true});
+  _upgradeToMV(lv,t);
   G('vcTitle').textContent=t.title||'Video';
   if(G('qpanel')&&G('qpanel').classList.contains('show'))renderQueue();
 }
@@ -3040,6 +3470,8 @@ function closeVideo(){
   const lv=G('localvid');
 
   // ── Tiempo exacto donde quedó el video ─────────────
+  // Sincronia continua (tipo YT Music): audio y video comparten el MISMO reloj, asi
+  // que el audio se reanuda justo en el minuto donde quedo el video.
   let resumeSec=lv.currentTime||0;
 
   // Libera el <video> CORRECTAMENTE. Poner src='' dispara un evento 'error'
@@ -3054,11 +3486,16 @@ function closeVideo(){
   // que en streaming desde la Pi a veces NUNCA llegan => el audio quedaba colgado
   // esperando y la UI parecia congelada (se "destrababa" al picar play/pause,
   // porque eso abortaba la espera). Ahora: buscar segundo y reproducir, sin esperas.
-  MA.muted=false;
-  // Reproducir PRIMERO (dentro del gesto de cerrar) y buscar despues: asi el navegador
-  // no bloquea el play por falta de gesto. Seguro: quita el spinner pase lo que pase.
-  const _p=MA.play();if(_p&&_p.catch)_p.catch(()=>{});
-  try{if(resumeSec>0&&isFinite(resumeSec)&&Math.abs((MA.currentTime||0)-resumeSec)>0.6)MA.currentTime=resumeSec;}catch(e){}
+  if(NATIVE){
+    _natResumeFromVideo(resumeSec);
+    window._vidOpen=false;
+  }else{
+    MA.muted=false;
+    // Reproducir PRIMERO (dentro del gesto de cerrar) y buscar despues: asi el navegador
+    // no bloquea el play por falta de gesto. Seguro: quita el spinner pase lo que pase.
+    const _p=MA.play();if(_p&&_p.catch)_p.catch(()=>{});
+    try{if(resumeSec>0&&isFinite(resumeSec)&&Math.abs((MA.currentTime||0)-resumeSec)>0.6)MA.currentTime=resumeSec;}catch(e){}
+  }
   G('bufRing').classList.remove('show');
   setTimeout(()=>{try{G('bufRing').classList.remove('show');}catch(e){}},2500);
   _wakeUI();
@@ -3144,7 +3581,7 @@ function ctxPlay(){const c=_ctx;closeCtx();if(!c)return; if(c.isLocal)playLocal(
 function ctxNext(){const c=_ctx;closeCtx();if(!c||!c.track)return;
   const tt=c.isLocal?_lTrack(c.track):c.track;
   if(!Q.length){Q=[tt];qi=-1;radioOn=!c.isLocal;playYT(0);return;}
-  Q.splice(qi+1,0,tt);G('bnext').disabled=false;toast('Se reproducirá a continuación','ok');
+  Q.splice(qi+1,0,tt);if(NATIVE){try{AndroidBG.insertItem(qi+1,JSON.stringify([_natItem(tt)]));}catch(e){}}G('bnext').disabled=false;toast('Se reproducirá a continuación','ok');
   if(G('qpanel')&&G('qpanel').classList.contains('show'))renderQueue();
 }
 function ctxPlaylist(){const c=_ctx;closeCtx();if(!c)return; plDropTrack=c.isLocal?_lTrack(c.track):c.track; _plPickerAt(_ctxXY.x,_ctxXY.y);}
@@ -3261,6 +3698,7 @@ const _IC_MIX='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentCo
 const _IC_CLOCK='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>';
 const _IC_FLAME='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2s4.5 3.3 4.5 8.5a4.5 4.5 0 0 1-9 0c0-1.7.8-3 1.5-3.9C9.8 8.6 11 7.5 12 2z"/></svg>';
 const _IC_PL='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h13M3 12h13M3 18h9"/><circle cx="19" cy="16" r="2"/><path d="M21 16V8"/></svg>';
+const _IC_ART='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/></svg>';
 const _IC_NOTE='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
 const _IC_PLAYF='<svg class="ic" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5.3c0-.8.86-1.3 1.54-.88l11 6.7c.65.4.65 1.36 0 1.76l-11 6.7A1.03 1.03 0 0 1 7 18.7z"/></svg>';
 
@@ -3349,10 +3787,11 @@ async function openArtist(name){
   }
 }
 
-function _relCards(list){
-  return '<div class="agrid">'+list.map(al=>
+function _relCards(list,cls){
+  // cls: "agrid" (grid, por defecto) o "shelf" (fila horizontal con scroll, tipo YT Music)
+  return '<div class="'+(cls||'agrid')+'">'+list.map(al=>
     '<div class="acard" onclick="openAlbum(\''+encodeURIComponent(al.id)+'\')">'+
-      '<div class="aw"><img src="'+esc(al.thumb)+'" loading="lazy" decoding="async" onload="this.classList.add(\'ld\')" onerror="this.parentElement.style.visibility=\'hidden\'"></div>'+
+      '<div class="aw"><img src="'+esc(al.thumb)+'" loading="lazy" decoding="async" onload="this.classList.add(\'ld\')" onerror="this.closest(\'.aw\').classList.add(\'noimg\')"><div class="aw-ph">'+_IC_NOTE+'</div></div>'+
       '<div class="an">'+esc(al.title)+'</div>'+
       (al.year?'<div class="ay">'+esc(al.year)+'</div>':'')+
     '</div>').join('')+'</div>';
@@ -3364,7 +3803,7 @@ function renderArtist(d,el){
   h+='<div class="art-hi"><div class="art-hn">'+esc(d.name)+'</div>'+
      (d.subs?'<div class="art-hs">'+esc(d.subs)+'</div>':'')+'</div></div>';
   if(d.songs&&d.songs.length)h+='<div class="sch"><h2>Canciones</h2></div><div class="grid" id="grid-ar"></div>';
-  if(d.albums&&d.albums.length)h+='<div class="sch ssep"><h2>Álbumes</h2></div>'+_relCards(d.albums);
+  if(d.albums&&d.albums.length)h+='<div class="sch ssep"><h2>Álbumes</h2></div>'+_relCards(d.albums,'shelf');
   if(d.singles&&d.singles.length)h+='<div class="sch ssep"><h2>Sencillos</h2></div>'+_relCards(d.singles);
   if((!d.songs||!d.songs.length)&&(!d.albums||!d.albums.length))
     h+='<div class="splash"><div class="splash-ico">'+IC.search+'</div><p>Sin resultados para este artista</p></div>';
@@ -3412,7 +3851,7 @@ function mkCard(t){
     </div>
     <div class="sr-meta">
       <div class="sr-ti">${esc(t.title)}</div>
-      <div class="sr-ar"><span class="sr-arn">${esc(t.channel)}</span>${t.plays>1?` · ${t.plays}▶`:''}</div>
+      <div class="sr-ar"><span class="sr-arn">${esc(t.channel)}</span></div>
     </div>
     <span class="sr-dur">${esc(t.dur||'')}</span>
     <button class="bov bdd sr-act" title="Descargar"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 11l5 4 5-4"/><path d="M5 20h14"/></svg></button>
@@ -3455,20 +3894,56 @@ async function fetchSearch(q,page){
 }
 
 function renderSearch(d,el){
-  if(!d.results?.length){el.innerHTML='<div class="splash"><div class="splash-ico"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div><p>Sin resultados</p></div>';return;}
+  const _hasSongs=!!(d.results&&d.results.length);
+  const _hasArt=!!(d.artists&&d.artists.length), _hasAlb=!!(d.albums&&d.albums.length);
+  if(!_hasSongs&&!_hasArt&&!_hasAlb){el.innerHTML='<div class="splash"><div class="splash-ico"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div><p>Sin resultados</p></div>';return;}
+  // Guardo los datos para cambiar de filtro sin volver a pedir a la red.
+  window._srData=d;
+  // Filtros tipo YT Music: por defecto se ven SOLO las canciones. Artistas y Albumes
+  // aparecen unicamente al tocar su chip (no estorban al buscar musica).
+  let _chips='';
+  if(_hasArt||_hasAlb){
+    _chips='<div class="chips sfil">'+
+      '<button class="chip on" data-f="songs" onclick="srFilter(\'songs\',this)">Canciones</button>'+
+      (_hasArt?'<button class="chip" data-f="artists" onclick="srFilter(\'artists\',this)">Artistas</button>':'')+
+      (_hasAlb?'<button class="chip" data-f="albums" onclick="srFilter(\'albums\',this)">Álbumes</button>':'')+
+      '</div>';
+  }
+  // Seccion ARTISTAS (rejilla de avatares circulares) — oculta por defecto
+  let _secArt='';
+  if(_hasArt){
+    _secArt='<div class="sr-sec" id="sr-artists" style="display:none"><div class="agrid">'+
+      d.artists.map(a=>'<div class="acard artc" data-n="'+esc(a.name)+'" onclick="openArtist(this.dataset.n)">'+
+        '<div class="aw"><img src="'+esc(a.thumb||'')+'" loading="lazy" decoding="async" onload="this.classList.add(\'ld\')" onerror="this.closest(\'.aw\').classList.add(\'noimg\')"><div class="aw-ph">'+_IC_ART+'</div></div>'+
+        '<div class="an">'+esc(a.name)+'</div></div>').join('')+'</div></div>';
+  }
+  // Seccion ALBUMES (rejilla) — oculta por defecto
+  let _secAlb='';
+  if(_hasAlb){ _secAlb='<div class="sr-sec" id="sr-albums" style="display:none">'+_relCards(d.albums,'agrid')+'</div>'; }
   el.innerHTML=`
-    <div class="sch"><h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg> "${esc(sqQ)}"</h2><small>pág. ${sqPage+1}</small></div>
-    <div class="grid" id="grid-s"></div>
-    <div class="pager">
-      <button class="pgb" ${sqPage===0?'disabled':''} onclick="fetchSearch(sqQ,sqPage-1)">◀ Anterior</button>
-      <span class="pgi">${TL('Pág')} ${sqPage+1}</span>
-      <button class="pgb" ${!sqHasNext?'disabled':''} onclick="fetchSearch(sqQ,sqPage+1)">Siguiente ▶</button>
+    ${_chips}
+    ${_secArt}
+    ${_secAlb}
+    <div class="sr-sec" id="sr-songs">
+      <div class="sch"><h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg> ${(_hasArt||_hasAlb)?'Canciones':('"'+esc(sqQ)+'"')}</h2><small>pág. ${sqPage+1}</small></div>
+      <div class="grid" id="grid-s"></div>
+      <div class="pager">
+        <button class="pgb" ${sqPage===0?'disabled':''} onclick="fetchSearch(sqQ,sqPage-1)">◀ Anterior</button>
+        <span class="pgi">${TL('Pág')} ${sqPage+1}</span>
+        <button class="pgb" ${!sqHasNext?'disabled':''} onclick="fetchSearch(sqQ,sqPage+1)">Siguiente ▶</button>
+      </div>
     </div>`;
   const g=G('grid-s');
   d.results.forEach(t=>{
     const div=document.createElement('div');div.innerHTML=mkCard(t);g.appendChild(div.firstElementChild);
   });
   bindCards(el,d.results);
+}
+// Cambia que seccion de la busqueda se ve (canciones / artistas / albumes)
+function srFilter(which,btn){
+  ['songs','artists','albums'].forEach(k=>{const s=G('sr-'+k);if(s)s.style.display=(k===which)?'':'none';});
+  const row=btn?btn.parentElement:null;
+  if(row)row.querySelectorAll('.chip').forEach(c=>c.classList.toggle('on',c===btn));
 }
 
 /* ═══ DESCARGA ═══════════════════════════════════════ */
@@ -3478,21 +3953,35 @@ let _curAlbum=null;let _curPl=null;let radioOn=true;
 function renderDlActive(){
   const box=G('dlActive');if(!box)return;
   const jobs=Object.entries(DLW.jobs).filter(e=>e[1].status==='dl');
-  if(!jobs.length&&!DLW.album){box.innerHTML='';return;}
-  let h='';
+  if(!jobs.length&&!DLW.album){box.innerHTML='';box._sig='';return;}
+  // Firma del CONJUNTO de descargas (album + ids). El DOM se reconstruye SOLO
+  // cuando cambia el conjunto; en cada tick de progreso solo se actualizan los
+  // anchos/porcentajes. Antes se reconstruia todo cada 450ms -> parpadeo del texto.
+  const sig=(DLW.album?('A|'+DLW.album.name+'|'+DLW.album.total):'')+'#'+jobs.map(e=>e[0]).join(',');
+  if(box._sig!==sig){
+    let h='';
+    if(DLW.album){
+      h+='<div class="sch"><h2>Descargando álbum</h2><small id="dla-c"></small></div>';
+      h+='<div class="dlrow"><div class="dlrow-t">'+esc(DLW.album.name)+'</div><div class="dlrow-bar"><div class="dlrow-f" id="dlf-_alb"></div></div><div class="dlrow-p" id="dlp-_alb"></div></div>';
+    }else if(jobs.length){
+      h+='<div class="sch"><h2>Descargando</h2><small>'+jobs.length+'</small></div>';
+    }
+    jobs.forEach(e=>{const id=e[0];
+      h+='<div class="dlrow"><div class="dlrow-t">'+esc((e[1].title||'').slice(0,42))+'</div><div class="dlrow-bar"><div class="dlrow-f" id="dlf-'+id+'"></div></div><div class="dlrow-p" id="dlp-'+id+'"></div></div>';
+    });
+    box.innerHTML=h;box._sig=sig;
+  }
   if(DLW.album){
     const pct=Math.round(DLW.album.done/Math.max(1,DLW.album.total)*100);
-    h+='<div class="sch"><h2>Descargando álbum</h2><small>'+DLW.album.done+'/'+DLW.album.total+'</small></div>';
-    h+='<div class="dlrow"><div class="dlrow-t">'+esc(DLW.album.name)+'</div><div class="dlrow-bar"><div class="dlrow-f" style="width:'+pct+'%"></div></div><div class="dlrow-p">'+pct+'%</div></div>';
-  }else if(jobs.length){
-    h+='<div class="sch"><h2>Descargando</h2><small>'+jobs.length+'</small></div>';
+    const f=G('dlf-_alb'),p=G('dlp-_alb'),c=G('dla-c');
+    if(f)f.style.width=pct+'%';if(p)p.textContent=pct+'%';if(c)c.textContent=DLW.album.done+'/'+DLW.album.total;
   }
-  jobs.forEach(e=>{const j=e[1],p=Math.round(j.pct);
-    h+='<div class="dlrow"><div class="dlrow-t">'+esc((j.title||'').slice(0,42))+'</div><div class="dlrow-bar"><div class="dlrow-f" style="width:'+p+'%"></div></div><div class="dlrow-p">'+p+'%</div></div>';
+  jobs.forEach(e=>{const pct=Math.round(e[1].pct);
+    const f=G('dlf-'+e[0]),p=G('dlp-'+e[0]);
+    if(f)f.style.width=pct+'%';if(p)p.textContent=pct+'%';
   });
-  box.innerHTML=h;
 }
-function dlPaint(){if(!G('panel-files').classList.contains('hidden'))renderDlActive();}
+function dlPaint(){renderDlActive();}
 function dlDone(msg){toast(msg||'Listo','ok');if(!G('panel-files').classList.contains('hidden'))renderDlActive();}
 function startDownload(t,ctx,card){
   return new Promise(resolve=>{
@@ -3519,6 +4008,7 @@ function startDownload(t,ctx,card){
               if(pf)pf.style.width=(proc?100:pct)+'%';
               if(pp)pp.textContent=proc?'···':(pct+'%');}
             if(s.status==='done'){clearInterval(pollers[t.id]);if(j){j.pct=100;j.status='done';}
+              if(NATIVE&&s.file){try{AndroidBG.exportToDownloads(s.file);}catch(e){}}
               if(card){const ov=G(ovId);if(ov)ov.remove();const b=card.querySelector('.bdd');if(b)b.style.color='var(--grn)';}
               if(DLW.album)DLW.album.done++;
               if(!(ctx&&ctx.album))toast(TL('Guardado')+': '+(t.title||'').slice(0,26),'ok');
@@ -3526,11 +4016,11 @@ function startDownload(t,ctx,card){
               resolve(true);}
             else if(s.status==='error'){clearInterval(pollers[t.id]);if(j)j.status='error';
               if(card){const ov=G(ovId);if(ov)ov.innerHTML='<span style="color:#e53935;font-size:10px;padding:4px">'+IC.x+'</span>';}
-              if(DLW.album)DLW.album.done++;dlPaint();if(!(ctx&&ctx.album))toast('Error al descargar','err');resolve(false);}
+              if(DLW.album)DLW.album.done++;dlPaint();if(!(ctx&&ctx.album))toast('Error: '+(((s&&s.error)||'').slice(0,90)||'no se pudo descargar'),'err');resolve(false);}
             else dlPaint();
           }catch(e){clearInterval(pollers[t.id]);resolve(false);}
         },450);
-      }).catch(()=>{if(!(ctx&&ctx.album))toast('Error al descargar','err');resolve(false);});
+      }).catch(()=>{if(!(ctx&&ctx.album))toast('Error: '+(((s&&s.error)||'').slice(0,90)||'no se pudo descargar'),'err');resolve(false);});
   });
 }
 async function dlAlbum(name,artist,tracks){
@@ -3597,13 +4087,36 @@ async function _playNextYT(){
   if(Q.length>1)playYT((qi+1)%Q.length);
 }
 async function startRadio(){
-  if(!curTrack||MODE!=='yt'){toast('Reproduce una canción primero','err');return;}
+  if(!curTrack){toast('Reproduce una canción primero','err');return;}
+  // Radio desde musica LOCAL/descargada: curTrack.id es "local:archivo" y no sirve
+  // de semilla. Resolvemos una semilla de YouTube buscando por metadatos (titulo +
+  // artista); el mix se reproduce por streaming desde esa coincidencia.
+  if(MODE!=='yt'||String(curTrack.id||'').indexOf('local:')===0){
+    const q=((curTrack.title||curTrack.name||'')+' '+(curTrack.artist||curTrack.channel||'')).trim();
+    if(q.length<2){toast('Esta canción no tiene datos (título/artista) para el radio','err');return;}
+    toast('Buscando para el mix…','dl');
+    let seed=null;
+    try{const sr=await(await fetch('/api/search?q='+encodeURIComponent(q))).json();seed=(sr.results||[])[0];}catch(e){}
+    if(!seed||!seed.id){toast('No encontré esta canción en YouTube para el radio','err');return;}
+    radioOn=true;
+    try{
+      const d=await(await fetch('/api/radio?seed='+encodeURIComponent(seed.id)+'&artist='+encodeURIComponent(seed.channel||''))).json();
+      const seen=new Set([seed.id]);
+      const extra=(d.tracks||[]).filter(t=>t.id&&!seen.has(t.id)&&(seen.add(t.id),true));
+      MODE='yt';Q=[seed,...extra];qi=0;
+      playYT(0);
+      G('bprev').disabled=false;G('bnext').disabled=Q.length<=1;
+      toast('Mix listo','ok');openQueue();
+    }catch(e){toast('No se pudo crear el mix','err');}
+    return;
+  }
   radioOn=true;toast('Creando mix de canciones…','dl');
   try{
     const d=await(await fetch('/api/radio?seed='+encodeURIComponent(curTrack.id)+'&artist='+encodeURIComponent(curTrack.channel||''))).json();
     const cur=Q[qi]||curTrack;
     const extra=(d.tracks||[]).filter(t=>t.id!==cur.id);
     Q=[cur,...extra];qi=0;
+    if(NATIVE){_natLastIdx=0;try{AndroidBG.radioRebuild(JSON.stringify(extra.map(_natItem)));AndroidBG.setRepeat(RPT);}catch(e){}}
     G('bprev').disabled=false;G('bnext').disabled=Q.length<=1;
     toast('Mix de canciones listo','ok');
     openQueue();
@@ -3844,6 +4357,11 @@ document.querySelectorAll('.ob:not(.lang-opt)').forEach(b=>{
     b.parentElement.querySelectorAll('.ob').forEach(x=>x.classList.remove('on'));b.classList.add('on');
     let v=b.dataset.val;if(b.dataset.key==='search_per_page')v=parseInt(v);
     pendCFG[b.dataset.key]=v;
+    // Audio-only solo es fiable con ffmpeg (modo web ejecutando app.py). En el APK
+    // no hay ffmpeg, asi que avisamos que solo Video funciona bien ahi.
+    if(b.dataset.key==='download_mode'&&v==='audio'&&CFG&&CFG.ffmpeg===false){
+      toast('Solo Audio funciona en modo web (ejecutando app.py). En la app usa Video.','err');
+    }
   };
 });
 async function saveCfg(){
@@ -3871,7 +4389,7 @@ IC.vol='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 function G(id){return document.getElementById(id);}
 function fmt(s){if(!s||isNaN(s))return'0:00';const m=Math.floor(s/60),x=Math.floor(s%60);return m+':'+x.toString().padStart(2,'0');}
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function toast(msg,type){const t=document.createElement('div');t.className='tst';if(type&&IC._t[type]){const i=document.createElement('span');i.className='tst-i';i.innerHTML=IC._t[type];t.appendChild(i);}const s=document.createElement('span');s.textContent=TL(msg);t.appendChild(s);G('toasts').appendChild(t);setTimeout(()=>t.remove(),3300);}
+function toast(msg,type){const t=document.createElement('div');t.className='tst'+(type?(' '+type):'');if(type&&IC._t[type]){const i=document.createElement('span');i.className='tst-i';i.innerHTML=IC._t[type];t.appendChild(i);}const s=document.createElement('span');s.textContent=TL(msg);t.appendChild(s);G('toasts').appendChild(t);setTimeout(()=>t.remove(),3300);}
 
 /* ═══ EVENTOS ═════════════════════════════════════════ */
 G('qb').onclick=()=>doSearch(G('qi').value);
