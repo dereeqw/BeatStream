@@ -3812,7 +3812,10 @@ function renderArtist(d,el){
   if(d.songs&&d.songs.length){
     const g=G('grid-ar');
     d.songs.forEach(t=>{const div=document.createElement('div');div.innerHTML=mkCard(t);g.appendChild(div.firstElementChild);});
-    Q=d.songs;qi=-1;
+    // NO se toca la cola global Q aqui: navegar un artista no debe cambiar lo que suena.
+    // La cola solo cambia cuando TOCAS una cancion (bindCards -> loadQ). Antes se ponia
+    // Q=d.songs y un callback nativo mapeaba su indice contra esta lista -> mostraba la
+    // portada/cancion equivocada del artista aunque siguiera sonando la pista anterior.
     bindCards(el,d.songs,true);
   }
 }
@@ -3835,7 +3838,7 @@ async function openAlbum(id){
     el.innerHTML=h;
     const g=G('grid-al');
     (d.tracks||[]).forEach(t=>{const div=document.createElement('div');div.innerHTML=mkCard(t);g.appendChild(div.firstElementChild);});
-    Q=d.tracks||[];qi=-1;
+    // Igual que en artista: no se toca Q al abrir un album; solo al tocar una pista.
     bindCards(el,d.tracks||[],true);
   }catch(e){toast('Error al cargar álbum','err');}
 }
@@ -3887,7 +3890,9 @@ async function fetchSearch(q,page){
   try{
     const d=await(await fetch(`/api/search?q=${encodeURIComponent(q)}&page=${page}`)).json();
     if(d.error){toast(d.error.slice(0,80),'err');return;}
-    Q=d.results;qi=-1;sqPage=page;sqHasNext=d.has_next;
+    // No se toca Q al buscar: la cola solo cambia al TOCAR una cancion (loadQ). Antes
+    // Q=d.results desincronizaba lo que sonaba con lo mostrado.
+    sqPage=page;sqHasNext=d.has_next;
     renderSearch(d,el);
   }catch(e){
     el.innerHTML='<div class="splash"><div class="splash-ico"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2 20h20z"/><path d="M12 9v5"/><path d="M12 17.5h.01"/></svg></div><p>Error al buscar</p></div>';
