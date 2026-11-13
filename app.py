@@ -1486,6 +1486,10 @@ header{height:var(--hdr);min-height:var(--hdr);background:var(--s1);
 .sb input::placeholder{color:var(--t3)}
 .sb button{color:var(--t2);width:40px;font-size:16px;flex-shrink:0;transition:color .15s}
 .sb button:hover{color:var(--tx)}
+/* Boton X para borrar la busqueda (como YouTube): oculto si no hay texto */
+.sb .qx{display:none;width:34px;font-size:15px;align-items:center;justify-content:center}
+.sb.has-text .qx{display:flex}
+[data-theme="green"] .sb .qx{color:#565656}
 .hbtn{color:var(--t2);font-size:17px;padding:5px 7px;border-radius:8px;
   transition:color .15s,background .15s;flex-shrink:0}
 .hbtn:hover{color:var(--tx);background:var(--s3)}
@@ -2281,6 +2285,7 @@ button{-webkit-tap-highlight-color:transparent}
   <div class="sb">
     <input id="qi" type="text" placeholder="Artista, canción, álbum…"
            autocomplete="off" spellcheck="false">
+    <button id="qx" class="qx" type="button" aria-label="Borrar búsqueda" title="Borrar">✕</button>
     <button id="qb">⌕</button>
   </div>
   <button class="hbtn" id="btnCfg"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
@@ -3686,6 +3691,8 @@ G('inpF').onkeydown=e=>{if(e.key==='Enter')G('inpOk').click();if(e.key==='Escape
 
 /* ═══ DASHBOARD ══════════════════════════════════════ */
 async function showDash(){
+  // Al tocar el logo tambien se borra la busqueda (texto + X)
+  const _qi=G('qi'); if(_qi)_qi.value=''; _toggleQx(); sqQ='';
   switchTab('home');
   const el=G('panel-home');
   el.innerHTML='<div class="swrap"><div class="spin"></div></div>';
@@ -3881,7 +3888,23 @@ function loadQ(tracks,idx,finite){Q=tracks;radioOn=!finite;playYT(idx);}
 async function doSearch(q,fromChip=false){
   q=q.trim();if(!q)return;
   if(fromChip)G('qi').value=q;
+  _toggleQx();
   sqQ=q;sqPage=0;switchTab('music');await fetchSearch(q,0);
+}
+// Muestra/oculta la X segun si el buscador tiene texto
+function _toggleQx(){
+  const qi=G('qi'); if(!qi)return;
+  const sb=qi.closest('.sb'); if(sb)sb.classList.toggle('has-text', !!qi.value.trim());
+}
+// Borra la busqueda (como la X de YouTube): limpia el texto y los resultados y deja
+// el buscador listo para escribir de nuevo.
+function clearSearch(focus){
+  const qi=G('qi'); if(qi)qi.value='';
+  _toggleQx();
+  sqQ='';sqPage=0;sqHasNext=false;
+  const el=G('panel-music');
+  if(el)el.innerHTML='<div class="splash"><div class="splash-ico"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div><p>Busca tu música favorita</p></div>';
+  if(focus&&qi){try{qi.focus();}catch(e){}}
 }
 
 async function fetchSearch(q,page){
@@ -4404,6 +4427,8 @@ G('qb').onclick=()=>doSearch(G('qi').value);
   if(ql.scrollTop+ql.clientHeight>=ql.scrollHeight-160)_radioMore();
 },{passive:true});})();
 G('qi').onkeydown=e=>{if(e.key==='Enter')doSearch(G('qi').value);};
+G('qi').oninput=_toggleQx;
+G('qx').onclick=()=>clearSearch(true);
 document.addEventListener('keydown',e=>{
   if(e.key===' '&&e.target.tagName!=='INPUT'){e.preventDefault();G('bplay').click();}
   if(e.key==='Escape'){closeCtx();closeQueue();closeNP();closeKaraoke();closeVideo();closeCfg();G('inpM').classList.remove('show');}
